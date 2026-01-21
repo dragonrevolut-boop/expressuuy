@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Inneria – Avatar Live</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0b0b; }
+    #app { position:relative; height:100%; }
+    #ui {
+      position:absolute; left:12px; bottom:12px; right:12px;
+      display:flex; gap:8px; align-items:center;
+      background:rgba(0,0,0,.45); padding:10px; border-radius:12px;
+      backdrop-filter: blur(8px);
+    }
+    #text { flex:1; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.06); color:#fff; outline:none; }
+    button { padding:10px 14px; border-radius:10px; border:0; background:#fff; cursor:pointer; }
+    #hint { position:absolute; top:12px; left:12px; color:#bdbdbd; font: 14px/1.4 system-ui; }
+    canvas { display:block; width:100%; height:100%; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="hint">Avatar live (VRM) – texte → voix → lip-sync</div>
+  <div id="ui">
+    <input id="text" placeholder="Écris un message (test TTS)..." />
+    <button id="speak">Parler</button>
+  </div>
+</div>
+
+<script type="module">
+  import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+  import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+  import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+  import { VRM, VRMLoaderPlugin, VRMUtils } from "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.0.0/lib/three-vrm.module.js";
+
+  // 👉 Mets ici l’URL publique de ton fichier .vrm (Sirv est parfait)
+  const VRM_URL = "https://TON_SIRV_URL/avatar.vrm";
+
+  const app = document.getElementById("app");
+  const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  app.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(30, window.innerWidth/window.innerHeight, 0.1, 100);
+  camera.position.set(0, 1.45, 2.3);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.45, 0);
+  controls.enablePan = false;
+  controls.enableDamping = true;
+
+  // lumières sobres (psy : calme)
+  const light1 = new THREE.DirectionalLight(0xffffff, 1.2);
+  light1.position.set(1, 2, 2);
+  scene.add(light1);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+
+  const loader = new GLTFLoader();
+  loader.register((parser) => new VRMLoaderPlugin(parser));
+
+  let currentVrm = null;
+
+  async function loadVrm(url) {
+    const gltf = await loader.loadAsync(url);
+    const vrm = gltf.userData.vrm;
+    VRMUtils.removeUnnecessaryJoints(gltf.scene);
+    vrm.scene.rotation.y = Math.PI; // face camera
+    scene.add(vrm.scene);
+    return vrm;
+  }
+
+  // audio + lip sync (basé amplitude = simple mais efficace)
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  const data = new Uint8Array(analyser.frequencyBinCount);
+
+  const audio = new Audio();
+  audio.crossOrigin = "anonymous";
+  let sourceNode = null;
+
+  function connectAudio() {
+    if (sourceNode) sourceNode.disconnect();
+    sourceNode = audioCtx.createMediaElementSource(audio);
+    sourceNode.connect(analyser);
+    analyser.connect(audioCtx.destination);
+  }
+
+  function setMouthOpen(amount) {
+    if (!currentVrm) return;
+    const exp = currentVrm.expressionManager;
+    if (!exp) return;
+
+    // VRM0/VRM1: on tente A / aa (selon export)
+    const v = Math.min(Math.max(amount, 0), 1);
+    exp.setValue("aa", v);
+    exp.setValue("A", v);
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+
+    // idle léger
+    if (currentVrm) {
+      currentVrm.scene.position.y = 0;
+      currentVrm.update(1/60);
+    }
+
+    // lip-sync
+    analyser.getByteFrequencyData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) sum += data[i];
+    const avg = sum / data.length;           // 0..255
+    const mouth = Math.min(avg / 90, 1);     // ajuste sensibilité
+    setMouthOpen(audio.paused ? 0 : mouth);
+
+    renderer.render(scene, camera);
+  }
+
+  window.addEventListener("resize", () => {
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  currentVrm = await loadVrm(VRM_URL);
+  animate();
+
+  connectAudio();
+
+  async function ttsSpeak(text) {
+    // IMPORTANT : déclenche l’audio context sur interaction user
+    if (audioCtx.state !== "running") await audioCtx.resume();
+
+    const r = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ text })
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      alert("TTS error: " + err);
+      return;
+    }
+    const { audioUrl } = await r.json();
+    audio.src = audioUrl;
+    await audio.play();
+  }
+
+  document.getElementById("speak").addEventListener("click", async () => {
+    const t = document.getElementById("text").value.trim();
+    if (!t) return;
+    await ttsSpeak(t);
+  });
+
+  // (plus tard) on branchera Botpress en appelant window.avatarSpeak(text)
+  window.avatarSpeak = ttsSpeak;
+</script>
+</body>
+</html>
